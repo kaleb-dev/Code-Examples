@@ -11,6 +11,12 @@ Requirements:
 - OpenCV Python package
 """
 
+import os
+# Suppress noisy ffmpeg/libav h264 decode warnings
+os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
+# Force RTSP over TCP to prevent UDP packet loss (eliminates h264 decode errors)
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+
 import cv2
 import numpy as np
 import time
@@ -34,6 +40,10 @@ MOTION_HOLD_FRAMES = 15          # Frames to hold motion state (reduces flickeri
 # Face detection parameters
 FACE_DETECTION_INTERVAL = 5      # Run face detection every N frames (for performance)
 FACE_HOLD_FRAMES = 15            # Frames to hold face detection state
+BODY_DETECTION_INTERVAL = 3      # Run body detection every N frames
+
+# Performance settings
+DETECTION_FRAME_WIDTH = 640      # Downscale frames to this width for detection (0 = no downscale)
 
 # Background subtractor settings
 BACKGROUND_DETECT_SHADOWS = True # Enable shadow detection in background subtraction
@@ -131,6 +141,14 @@ class PTZMotionDetector:
         self.face_frames_count = 0
         self.face_hold_frames = FACE_HOLD_FRAMES
         self.last_face_result = (False, [])
+
+        # Body detection frame skipping and persistence
+        self.body_detection_counter = 0
+        self.body_frames_count = 0
+        self.last_body_result = (False, [])
+
+        # Detection scale factor (computed on first frame)
+        self.detection_scale = 1.0
 
         # Click-to-track: user selects a specific target by clicking on it
         self.selected_target = None        # (x, y, w, h) of the user-selected target
@@ -299,30 +317,54 @@ class PTZMotionDetector:
 
     def get_camera_frame(self):
         """
-        Retrieve a single frame from the PTZOptics camera via RTSP.
-        
-        Establishes RTSP connection on first call and maintains the stream
-        for subsequent frame captures.
-        
+        Retrieve the most recent frame from the PTZOptics camera via RTSP.
+
+        Uses TCP transport to eliminate h264 decode errors from UDP packet loss.
+        Minimal buffer size and frame dropping ensure we always process the
+        latest frame, keeping detection in sync with what's happening live.
+
         Returns:
             numpy.ndarray: Camera frame as BGR image, or None if retrieval failed
         """
         if self.cap is None:
             print(f"Connecting to RTSP stream: {self.rtsp_url}")
-            self.cap = cv2.VideoCapture(self.rtsp_url)
+            self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+            # Force TCP transport to prevent h264 packet loss errors
+            self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+            self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+            if not self.cap.isOpened():
+                # Retry with TCP RTSP URL directly
+                tcp_url = f"{self.rtsp_url}?tcp"
+                print(f"Retrying with TCP: {tcp_url}")
+                self.cap = cv2.VideoCapture(tcp_url, cv2.CAP_FFMPEG)
             if not self.cap.isOpened():
                 print("Failed to open RTSP stream")
+                self.cap = None
                 return None
-        
+            # Minimal buffer to reduce latency
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            print("RTSP stream connected")
+
+        # Drain buffer: grab (discard) all queued frames, then retrieve only the latest
+        # This prevents the stream from falling behind real-time
+        for _ in range(5):
+            grabbed = self.cap.grab()
+            if not grabbed:
+                break
+
+        ret, frame = self.cap.retrieve()
+        if ret:
+            return frame
+
+        # If retrieve failed, try a simple read as fallback
         ret, frame = self.cap.read()
         if ret:
             return frame
-        else:
-            print("Failed to read frame from RTSP stream, attempting reconnection...")
-            # Try to reconnect
-            self.cap.release()
-            self.cap = None
-            return None
+
+        print("Failed to read frame from RTSP stream, attempting reconnection...")
+        self.cap.release()
+        self.cap = None
+        return None
     
     def detect_motion(self, frame):
         """
@@ -374,93 +416,106 @@ class PTZMotionDetector:
             else:
                 return False
     
-    def detect_person(self, frame):
+    def get_detection_frame(self, frame):
         """
-        Detect faces in the frame using Haar cascade classifier.
-        
-        Uses OpenCV's pre-trained face detector to identify human faces.
-        More reliable than full-body detection for people at desks or partially visible.
-        
+        Prepare a downscaled grayscale frame for detection.
+
+        Downscaling improves performance significantly while still detecting
+        bodies and faces reliably. Coordinates are scaled back to full resolution.
+
         Args:
-            frame (numpy.ndarray): Input frame from camera
-            
+            frame (numpy.ndarray): Full resolution BGR frame
+
         Returns:
-            tuple: (person_detected, people_rectangles)
-                - person_detected (bool): True if one or more faces detected
-                - people_rectangles (list): List of (x,y,w,h) detection rectangles
+            numpy.ndarray: Grayscale frame scaled for detection
         """
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Detect faces using Haar cascade classifier
+        if DETECTION_FRAME_WIDTH > 0 and frame.shape[1] > DETECTION_FRAME_WIDTH:
+            self.detection_scale = DETECTION_FRAME_WIDTH / frame.shape[1]
+            small = cv2.resize(frame, None, fx=self.detection_scale, fy=self.detection_scale)
+            return cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        else:
+            self.detection_scale = 1.0
+            return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    def scale_detections(self, detections):
+        """Scale detection rectangles back to full frame coordinates."""
+        if self.detection_scale == 1.0 or len(detections) == 0:
+            return detections
+        s = 1.0 / self.detection_scale
+        return [(int(x * s), int(y * s), int(w * s), int(h * s)) for (x, y, w, h) in detections]
+
+    def detect_person(self, gray):
+        """Detect faces in a grayscale frame."""
         people = self.person_cascade.detectMultiScale(
-            gray, 
-            scaleFactor=PERSON_SCALE_FACTOR, 
+            gray,
+            scaleFactor=PERSON_SCALE_FACTOR,
             minNeighbors=PERSON_MIN_NEIGHBORS,
             minSize=PERSON_MIN_SIZE
         )
-        
         return len(people) > 0, people
 
-    def detect_bodies(self, frame):
-        """
-        Detect full human bodies in the frame using Haar cascade classifier.
-
-        Args:
-            frame (numpy.ndarray): Input frame from camera
-
-        Returns:
-            tuple: (bodies_detected, body_rectangles)
-                - bodies_detected (bool): True if one or more bodies detected
-                - body_rectangles (list): List of (x,y,w,h) detection rectangles
-        """
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
+    def detect_bodies(self, gray):
+        """Detect full human bodies in a grayscale frame."""
         bodies = self.body_cascade.detectMultiScale(
             gray,
             scaleFactor=BODY_SCALE_FACTOR,
             minNeighbors=BODY_MIN_NEIGHBORS,
             minSize=BODY_MIN_SIZE
         )
-
         return len(bodies) > 0, bodies
 
-    def detect_person_with_persistence(self, frame):
+    def detect_person_with_persistence(self, gray):
         """
         Detect faces with frame skipping and result persistence for performance.
-        
+
         Runs face detection every N frames and persists the result for smooth display.
-        This reduces CPU usage while maintaining responsive face detection.
-        
-        Args:
-            frame (numpy.ndarray): Input frame from camera
-            
-        Returns:
-            tuple: (person_detected, people_rectangles)
-                - person_detected (bool): True if faces detected (with persistence)
-                - people_rectangles (list): List of (x,y,w,h) detection rectangles
+        Results are returned in full-frame coordinates.
         """
         self.face_detection_counter += 1
-        
-        # Run actual face detection every N frames
+
         if self.face_detection_counter >= FACE_DETECTION_INTERVAL:
             self.face_detection_counter = 0
-            face_detected, faces = self.detect_person(frame)
-            
+            face_detected, faces = self.detect_person(gray)
+            faces = self.scale_detections(faces)
+
             if face_detected:
-                # Face found - reset persistence counter and store result
                 self.face_frames_count = self.face_hold_frames
                 self.last_face_result = (True, faces)
                 return True, faces
             else:
-                # No face found - but don't immediately clear if we were persisting
                 if self.face_frames_count <= 0:
                     self.last_face_result = (False, [])
-        
-        # Check if we should persist previous face detection
+
         if self.face_frames_count > 0:
             self.face_frames_count -= 1
-            # Return the persisted result with the original face rectangles
             return self.last_face_result
+        else:
+            return False, []
+
+    def detect_bodies_with_persistence(self, gray):
+        """
+        Detect bodies with frame skipping and result persistence for performance.
+
+        Results are returned in full-frame coordinates.
+        """
+        self.body_detection_counter += 1
+
+        if self.body_detection_counter >= BODY_DETECTION_INTERVAL:
+            self.body_detection_counter = 0
+            body_detected, bodies = self.detect_bodies(gray)
+            bodies = self.scale_detections(bodies)
+
+            if body_detected:
+                self.body_frames_count = FACE_HOLD_FRAMES
+                self.last_body_result = (True, bodies)
+                return True, bodies
+            else:
+                if self.body_frames_count <= 0:
+                    self.last_body_result = (False, [])
+
+        if self.body_frames_count > 0:
+            self.body_frames_count -= 1
+            return self.last_body_result
         else:
             return False, []
     
@@ -511,17 +566,16 @@ class PTZMotionDetector:
             
             frame_count += 1
             
-            # Detect motion
+            # Detect motion (runs on full frame for accuracy)
             raw_motion_detected, motion_areas, fg_mask = self.detect_motion(frame)
-            
-            # Apply smoothing to motion detection
             motion_detected = self.smooth_motion_detection(raw_motion_detected)
-            
-            # Check for faces with frame skipping and persistence (runs independently of motion)
-            person_detected, people = self.detect_person_with_persistence(frame)
 
-            # Detect full human bodies
-            bodies_detected, bodies = self.detect_bodies(frame)
+            # Prepare downscaled grayscale once, shared by face and body detection
+            gray = self.get_detection_frame(frame)
+
+            # Detect faces and bodies with frame skipping for performance
+            person_detected, people = self.detect_person_with_persistence(gray)
+            bodies_detected, bodies = self.detect_bodies_with_persistence(gray)
 
             # PTZ tracking: only tracks when user clicks to select a target
             if self.tracking_enabled:
@@ -609,9 +663,9 @@ class PTZMotionDetector:
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
             
-            # Brief pause to prevent excessive CPU usage
-            time.sleep(0.01)
-        
+            # waitKey(1) in the display loop provides the frame pacing
+            # No additional sleep needed - frame grab is the natural throttle
+
         self.cleanup()
         if display:
             cv2.destroyAllWindows()
