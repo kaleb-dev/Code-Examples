@@ -1,3 +1,4 @@
 *.json
 */csharp/*/bin/
 */csharp/*/obj/
+__pycache__/
