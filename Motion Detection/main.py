@@ -27,9 +27,9 @@ from requests.auth import HTTPDigestAuth
 DEFAULT_RTSP_STREAM = "stream2"  # Use stream2 for lower latency, stream1 for higher quality
 
 # Motion detection parameters
-DEFAULT_SENSITIVITY = 25         # Motion sensitivity (lower = more sensitive)
-DEFAULT_MIN_AREA = 300           # Minimum motion area in pixels to trigger detection
-MOTION_HOLD_FRAMES = 10          # Frames to hold motion state (reduces flickering)
+DEFAULT_SENSITIVITY = 50         # Motion sensitivity (lower = more sensitive)
+DEFAULT_MIN_AREA = 1500          # Minimum motion area in pixels to trigger detection
+MOTION_HOLD_FRAMES = 15          # Frames to hold motion state (reduces flickering)
 
 # Face detection parameters
 FACE_DETECTION_INTERVAL = 5      # Run face detection every N frames (for performance)
@@ -46,14 +46,14 @@ PERSON_MIN_SIZE = (30, 30)       # Minimum size for person detection
 
 # Full body detection settings
 BODY_SCALE_FACTOR = 1.05         # Scale factor for full body detection
-BODY_MIN_NEIGHBORS = 2           # Minimum neighbors for full body detection
-BODY_MIN_SIZE = (50, 100)        # Minimum size for full body detection (wider aspect)
+BODY_MIN_NEIGHBORS = 3           # Minimum neighbors for full body detection (higher = fewer false positives)
+BODY_MIN_SIZE = (60, 120)        # Minimum size for full body detection
 
 # PTZ tracking settings
-PTZ_DEAD_ZONE = 50               # Pixels from center before camera moves
-PTZ_SPEED_DIVISOR = 30           # Higher = slower speed scaling (distance / divisor = speed)
-PTZ_MAX_SPEED = 24               # Maximum pan speed (PTZOptics range: 1-24)
-PTZ_TILT_MAX_SPEED = 20          # Maximum tilt speed (PTZOptics range: 1-20)
+PTZ_DEAD_ZONE = 80               # Pixels from center before camera moves (wider = smoother)
+PTZ_SPEED_DIVISOR = 50           # Higher = slower speed scaling for smoother movement
+PTZ_MAX_SPEED = 12               # Maximum pan speed (PTZOptics range: 1-24, capped low for smoothness)
+PTZ_TILT_MAX_SPEED = 10          # Maximum tilt speed (PTZOptics range: 1-20, capped low for smoothness)
 
 # Display settings
 MOTION_COLOR = (0, 255, 0)       # Green color for motion bounding boxes (BGR)
