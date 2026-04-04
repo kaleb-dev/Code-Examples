@@ -27,9 +27,9 @@ from requests.auth import HTTPDigestAuth
 DEFAULT_RTSP_STREAM = "stream2"  # Use stream2 for lower latency, stream1 for higher quality
 
 # Motion detection parameters
-DEFAULT_SENSITIVITY = 25         # Motion sensitivity (lower = more sensitive)
-DEFAULT_MIN_AREA = 300           # Minimum motion area in pixels to trigger detection
-MOTION_HOLD_FRAMES = 10          # Frames to hold motion state (reduces flickering)
+DEFAULT_SENSITIVITY = 50         # Motion sensitivity (lower = more sensitive)
+DEFAULT_MIN_AREA = 1500          # Minimum motion area in pixels to trigger detection
+MOTION_HOLD_FRAMES = 15          # Frames to hold motion state (reduces flickering)
 
 # Face detection parameters
 FACE_DETECTION_INTERVAL = 5      # Run face detection every N frames (for performance)
@@ -44,15 +44,21 @@ PERSON_SCALE_FACTOR = 1.1        # Scale factor for person detection
 PERSON_MIN_NEIGHBORS = 3         # Minimum neighbors for person detection
 PERSON_MIN_SIZE = (30, 30)       # Minimum size for person detection
 
+# Full body detection settings
+BODY_SCALE_FACTOR = 1.05         # Scale factor for full body detection
+BODY_MIN_NEIGHBORS = 3           # Minimum neighbors for full body detection (higher = fewer false positives)
+BODY_MIN_SIZE = (60, 120)        # Minimum size for full body detection
+
 # PTZ tracking settings
-PTZ_DEAD_ZONE = 50               # Pixels from center before camera moves
-PTZ_SPEED_DIVISOR = 30           # Higher = slower speed scaling (distance / divisor = speed)
-PTZ_MAX_SPEED = 24               # Maximum pan speed (PTZOptics range: 1-24)
-PTZ_TILT_MAX_SPEED = 20          # Maximum tilt speed (PTZOptics range: 1-20)
+PTZ_DEAD_ZONE = 80               # Pixels from center before camera moves (wider = smoother)
+PTZ_SPEED_DIVISOR = 50           # Higher = slower speed scaling for smoother movement
+PTZ_MAX_SPEED = 12               # Maximum pan speed (PTZOptics range: 1-24, capped low for smoothness)
+PTZ_TILT_MAX_SPEED = 10          # Maximum tilt speed (PTZOptics range: 1-20, capped low for smoothness)
 
 # Display settings
 MOTION_COLOR = (0, 255, 0)       # Green color for motion bounding boxes (BGR)
-PERSON_COLOR = (0, 0, 255)       # Red color for person bounding boxes (BGR)
+PERSON_COLOR = (0, 0, 255)       # Red color for face bounding boxes (BGR)
+BODY_COLOR = (255, 0, 255)       # Magenta color for body bounding boxes (BGR)
 TRACKING_COLOR = (255, 165, 0)   # Orange color for tracking crosshair (BGR)
 STATUS_COLOR = (0, 255, 255)     # Yellow color for status text (BGR)
 
@@ -108,9 +114,12 @@ class PTZMotionDetector:
             detectShadows=BACKGROUND_DETECT_SHADOWS
         )
 
-        # Load Haar cascade classifier for face detection
+        # Load Haar cascade classifiers for face and full body detection
         self.person_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
+        self.body_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_fullbody.xml'
         )
 
         # Motion smoothing to reduce flickering between motion/no-motion states
@@ -144,16 +153,15 @@ class PTZMotionDetector:
             self.click_point = None
             print("Target selection cleared - returning to automatic tracking")
 
-    def select_target_from_click(self, people, motion_areas):
+    def select_target_from_click(self, detections):
         """
-        Match a mouse click to the nearest detected face or motion area.
+        Match a mouse click to a detected object (body, face, or motion area).
 
-        Prioritizes faces over motion areas. Selects the detection whose
-        bounding box contains the click point.
+        Selects the first detection whose bounding box contains the click point.
+        Pass detections in priority order (bodies first, then faces, then motion).
 
         Args:
-            people: List of (x, y, w, h) face detections
-            motion_areas: List of (x, y, w, h) motion detections
+            detections: List of (x, y, w, h) detection rectangles in priority order
         """
         if self.click_point is None:
             return
@@ -161,25 +169,16 @@ class PTZMotionDetector:
         cx, cy = self.click_point
         self.click_point = None
 
-        # Check faces first (higher priority)
-        for (x, y, w, h) in people:
+        for (x, y, w, h) in detections:
             if x <= cx <= x + w and y <= cy <= y + h:
                 self.selected_target = (x, y, w, h)
                 self.selected_target_center = (x + w // 2, y + h // 2)
-                print(f"Selected face target at ({x}, {y}, {w}x{h})")
-                return
-
-        # Then check motion areas
-        for (x, y, w, h) in motion_areas:
-            if x <= cx <= x + w and y <= cy <= y + h:
-                self.selected_target = (x, y, w, h)
-                self.selected_target_center = (x + w // 2, y + h // 2)
-                print(f"Selected motion target at ({x}, {y}, {w}x{h})")
+                print(f"Selected target at ({x}, {y}, {w}x{h})")
                 return
 
         print("No detected target at click location")
 
-    def update_selected_target(self, people, motion_areas):
+    def update_selected_target(self, detections):
         """
         Update the selected target position by finding the closest match
         in the current frame's detections.
@@ -187,8 +186,7 @@ class PTZMotionDetector:
         Uses overlap (IoU) to track the same object across frames.
 
         Args:
-            people: List of (x, y, w, h) face detections
-            motion_areas: List of (x, y, w, h) motion detections
+            detections: List of (x, y, w, h) detection rectangles
 
         Returns:
             tuple or None: (target_x, target_y) center of the matched target
@@ -200,9 +198,7 @@ class PTZMotionDetector:
         best_match = None
         best_overlap = 0
 
-        # Search all detections for best overlap with selected target
-        all_detections = list(people) + list(motion_areas)
-        for (x, y, w, h) in all_detections:
+        for (x, y, w, h) in detections:
             # Calculate intersection
             ix1 = max(sx, x)
             iy1 = max(sy, y)
@@ -404,7 +400,30 @@ class PTZMotionDetector:
         )
         
         return len(people) > 0, people
-    
+
+    def detect_bodies(self, frame):
+        """
+        Detect full human bodies in the frame using Haar cascade classifier.
+
+        Args:
+            frame (numpy.ndarray): Input frame from camera
+
+        Returns:
+            tuple: (bodies_detected, body_rectangles)
+                - bodies_detected (bool): True if one or more bodies detected
+                - body_rectangles (list): List of (x,y,w,h) detection rectangles
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        bodies = self.body_cascade.detectMultiScale(
+            gray,
+            scaleFactor=BODY_SCALE_FACTOR,
+            minNeighbors=BODY_MIN_NEIGHBORS,
+            minSize=BODY_MIN_SIZE
+        )
+
+        return len(bodies) > 0, bodies
+
     def detect_person_with_persistence(self, frame):
         """
         Detect faces with frame skipping and result persistence for performance.
@@ -473,8 +492,8 @@ class PTZMotionDetector:
         """
         print(f"Starting PTZOptics motion detection for camera at {self.camera_ip}")
         if self.tracking_enabled:
-            print("PTZ tracking enabled - camera will follow detected targets")
-            print("Left-click a detected target to lock onto it, right-click to clear selection")
+            print("PTZ tracking enabled - click a detected body, face, or motion area to track it")
+            print("Left-click to select a target, right-click to stop tracking")
         print("Press 'q' to quit the display window")
 
         if display and self.tracking_enabled:
@@ -501,31 +520,23 @@ class PTZMotionDetector:
             # Check for faces with frame skipping and persistence (runs independently of motion)
             person_detected, people = self.detect_person_with_persistence(frame)
 
-            # PTZ tracking: click-to-select overrides automatic, then faces, then motion
+            # Detect full human bodies
+            bodies_detected, bodies = self.detect_bodies(frame)
+
+            # PTZ tracking: only tracks when user clicks to select a target
             if self.tracking_enabled:
-                # Check for new click selection
-                self.select_target_from_click(people, motion_areas)
+                # All clickable detections: bodies first, then faces, then motion
+                all_clickable = list(bodies) + list(people) + list(motion_areas)
+                self.select_target_from_click(all_clickable)
 
                 if self.selected_target is not None:
-                    # User has selected a specific target - track it
-                    target_pos = self.update_selected_target(people, motion_areas)
+                    target_pos = self.update_selected_target(all_clickable)
                     if target_pos:
                         self.track_target(target_pos[0], target_pos[1],
                                           frame.shape[1], frame.shape[0])
                     else:
-                        # Selected target was lost, stop camera
                         self.tracking_target = None
                         self.stop_camera()
-                elif person_detected and len(people) > 0:
-                    # Auto-track the largest face
-                    largest = max(people, key=lambda r: r[2] * r[3])
-                    x, y, w, h = largest
-                    self.track_target(x + w // 2, y + h // 2, frame.shape[1], frame.shape[0])
-                elif motion_detected and len(motion_areas) > 0:
-                    # Fall back to tracking largest motion area
-                    largest = max(motion_areas, key=lambda r: r[2] * r[3])
-                    x, y, w, h = largest
-                    self.track_target(x + w // 2, y + h // 2, frame.shape[1], frame.shape[0])
                 else:
                     self.tracking_target = None
                     self.stop_camera()
@@ -544,12 +555,18 @@ class PTZMotionDetector:
                     cv2.putText(display_frame, "Face", (x, y - 10),
                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, PERSON_COLOR, 2)
 
+                # Draw full body detections in magenta
+                for (x, y, w, h) in bodies:
+                    cv2.rectangle(display_frame, (x, y), (x + w, y + h), BODY_COLOR, 2)
+                    cv2.putText(display_frame, "Body", (x, y - 10),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, BODY_COLOR, 2)
+
                 # Draw tracking visuals
                 if self.tracking_enabled and self.tracking_target:
                     tx, ty = self.tracking_target
                     cv2.drawMarker(display_frame, (tx, ty), TRACKING_COLOR,
                                    cv2.MARKER_CROSS, 30, 2)
-                    label = "LOCKED" if self.selected_target else "TRACKING"
+                    label = "TRACKING"
                     cv2.putText(display_frame, label, (tx + 15, ty - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, TRACKING_COLOR, 2)
 
@@ -570,9 +587,9 @@ class PTZMotionDetector:
                 
                 # Display detection status text
                 if self.tracking_enabled and self.selected_target:
-                    status = "LOCKED ON TARGET"
-                elif self.tracking_enabled and self.tracking_target:
-                    status = "TRACKING FACE" if person_detected else "TRACKING MOTION"
+                    status = "TRACKING SELECTED TARGET"
+                elif self.tracking_enabled:
+                    status = "CLICK A TARGET TO TRACK"
                 elif motion_detected and person_detected:
                     status = "MOTION + FACE"
                 elif motion_detected:
