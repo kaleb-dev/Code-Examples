@@ -16,6 +16,8 @@ import numpy as np
 import time
 from datetime import datetime
 import argparse
+import requests
+from requests.auth import HTTPDigestAuth
 
 # =============================================================================
 # CONFIGURATION VARIABLES - Modify these for your specific setup
@@ -42,9 +44,16 @@ PERSON_SCALE_FACTOR = 1.1        # Scale factor for person detection
 PERSON_MIN_NEIGHBORS = 3         # Minimum neighbors for person detection
 PERSON_MIN_SIZE = (30, 30)       # Minimum size for person detection
 
+# PTZ tracking settings
+PTZ_DEAD_ZONE = 50               # Pixels from center before camera moves
+PTZ_SPEED_DIVISOR = 30           # Higher = slower speed scaling (distance / divisor = speed)
+PTZ_MAX_SPEED = 24               # Maximum pan speed (PTZOptics range: 1-24)
+PTZ_TILT_MAX_SPEED = 20          # Maximum tilt speed (PTZOptics range: 1-20)
+
 # Display settings
 MOTION_COLOR = (0, 255, 0)       # Green color for motion bounding boxes (BGR)
 PERSON_COLOR = (0, 0, 255)       # Red color for person bounding boxes (BGR)
+TRACKING_COLOR = (255, 165, 0)   # Orange color for tracking crosshair (BGR)
 STATUS_COLOR = (0, 255, 255)     # Yellow color for status text (BGR)
 
 # Status indicator settings
@@ -65,43 +74,233 @@ class PTZMotionDetector:
     with Haar cascade classifiers for face detection.
     """
     
-    def __init__(self, camera_ip, sensitivity=DEFAULT_SENSITIVITY, min_area=DEFAULT_MIN_AREA, stream="stream2"):
+    def __init__(self, camera_ip, sensitivity=DEFAULT_SENSITIVITY, min_area=DEFAULT_MIN_AREA,
+                 stream="stream2", enable_tracking=False, username="admin", password="admin"):
         """
         Initialize the motion detector for a PTZOptics camera.
-        
+
         Args:
             camera_ip (str): IP address of the PTZOptics camera
             sensitivity (int): Motion sensitivity threshold (lower = more sensitive)
             min_area (int): Minimum area in pixels to consider as motion
             stream (str): RTSP stream to use (stream1 for higher quality, stream2 for lower latency)
+            enable_tracking (bool): Enable PTZ tracking to follow detected targets
+            username (str): Camera username for HTTP-CGI authentication
+            password (str): Camera password for HTTP-CGI authentication
         """
         self.camera_ip = camera_ip
         self.rtsp_url = f"rtsp://{camera_ip}/{stream}"
         self.cap = None
-        
+
         self.sensitivity = sensitivity
         self.min_area = min_area
-        
+
+        # PTZ tracking configuration
+        self.tracking_enabled = enable_tracking
+        self.cgi_url = f"http://{camera_ip}/cgi-bin/ptzctrl.cgi"
+        self.http_session = requests.Session()
+        if username and password:
+            self.http_session.auth = HTTPDigestAuth(username, password)
+        self.tracking_target = None  # (x, y) of current tracking target for display
+
         # Initialize background subtractor for motion detection
         self.background_subtractor = cv2.createBackgroundSubtractorMOG2(
             detectShadows=BACKGROUND_DETECT_SHADOWS
         )
-        
+
         # Load Haar cascade classifier for face detection
         self.person_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
         )
-        
+
         # Motion smoothing to reduce flickering between motion/no-motion states
         self.motion_frames_count = 0
         self.motion_hold_frames = MOTION_HOLD_FRAMES
-        
+
         # Face detection frame skipping and persistence
         self.face_detection_counter = 0
         self.face_frames_count = 0
         self.face_hold_frames = FACE_HOLD_FRAMES
         self.last_face_result = (False, [])
+
+        # Click-to-track: user selects a specific target by clicking on it
+        self.selected_target = None        # (x, y, w, h) of the user-selected target
+        self.selected_target_center = None # (x, y) center of selected target
+        self.click_point = None            # Raw click coordinates for initial selection
         
+    def on_mouse_click(self, event, x, y, flags, param):
+        """
+        Mouse callback for click-to-track.
+
+        Left-click on a detected face or motion area to lock tracking onto it.
+        Right-click to clear the selection and return to automatic tracking.
+        """
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.click_point = (x, y)
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            # Right-click clears selection
+            self.selected_target = None
+            self.selected_target_center = None
+            self.click_point = None
+            print("Target selection cleared - returning to automatic tracking")
+
+    def select_target_from_click(self, people, motion_areas):
+        """
+        Match a mouse click to the nearest detected face or motion area.
+
+        Prioritizes faces over motion areas. Selects the detection whose
+        bounding box contains the click point.
+
+        Args:
+            people: List of (x, y, w, h) face detections
+            motion_areas: List of (x, y, w, h) motion detections
+        """
+        if self.click_point is None:
+            return
+
+        cx, cy = self.click_point
+        self.click_point = None
+
+        # Check faces first (higher priority)
+        for (x, y, w, h) in people:
+            if x <= cx <= x + w and y <= cy <= y + h:
+                self.selected_target = (x, y, w, h)
+                self.selected_target_center = (x + w // 2, y + h // 2)
+                print(f"Selected face target at ({x}, {y}, {w}x{h})")
+                return
+
+        # Then check motion areas
+        for (x, y, w, h) in motion_areas:
+            if x <= cx <= x + w and y <= cy <= y + h:
+                self.selected_target = (x, y, w, h)
+                self.selected_target_center = (x + w // 2, y + h // 2)
+                print(f"Selected motion target at ({x}, {y}, {w}x{h})")
+                return
+
+        print("No detected target at click location")
+
+    def update_selected_target(self, people, motion_areas):
+        """
+        Update the selected target position by finding the closest match
+        in the current frame's detections.
+
+        Uses overlap (IoU) to track the same object across frames.
+
+        Args:
+            people: List of (x, y, w, h) face detections
+            motion_areas: List of (x, y, w, h) motion detections
+
+        Returns:
+            tuple or None: (target_x, target_y) center of the matched target
+        """
+        if self.selected_target is None:
+            return None
+
+        sx, sy, sw, sh = self.selected_target
+        best_match = None
+        best_overlap = 0
+
+        # Search all detections for best overlap with selected target
+        all_detections = list(people) + list(motion_areas)
+        for (x, y, w, h) in all_detections:
+            # Calculate intersection
+            ix1 = max(sx, x)
+            iy1 = max(sy, y)
+            ix2 = min(sx + sw, x + w)
+            iy2 = min(sy + sh, y + h)
+
+            if ix2 > ix1 and iy2 > iy1:
+                intersection = (ix2 - ix1) * (iy2 - iy1)
+                union = sw * sh + w * h - intersection
+                overlap = intersection / union if union > 0 else 0
+
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_match = (x, y, w, h)
+
+        if best_match and best_overlap > 0.1:
+            x, y, w, h = best_match
+            self.selected_target = best_match
+            self.selected_target_center = (x + w // 2, y + h // 2)
+            return self.selected_target_center
+        else:
+            # Target lost
+            print("Selected target lost")
+            self.selected_target = None
+            self.selected_target_center = None
+            return None
+
+    def move_camera(self, direction, pan_speed=5, tilt_speed=5):
+        """
+        Send a PTZ move command via HTTP-CGI.
+
+        Args:
+            direction (str): Movement direction (left, right, up, down, leftup, rightup, leftdown, rightdown)
+            pan_speed (int): Pan speed 1-24
+            tilt_speed (int): Tilt speed 1-20
+        """
+        url = f"{self.cgi_url}?ptzcmd&{direction}&{pan_speed}&{tilt_speed}"
+        try:
+            self.http_session.get(url, timeout=1)
+        except requests.RequestException:
+            pass
+
+    def stop_camera(self):
+        """Send a PTZ stop command via HTTP-CGI."""
+        url = f"{self.cgi_url}?ptzcmd&ptzstop&0&0"
+        try:
+            self.http_session.get(url, timeout=1)
+        except requests.RequestException:
+            pass
+
+    def track_target(self, target_x, target_y, frame_width, frame_height):
+        """
+        Move camera to center on a target position.
+
+        Calculates the offset from frame center and sends appropriate PTZ commands
+        to move the camera toward the target. Uses a dead zone to avoid jitter
+        and scales speed based on distance from center.
+
+        Args:
+            target_x (int): Target X position in pixels
+            target_y (int): Target Y position in pixels
+            frame_width (int): Width of the video frame
+            frame_height (int): Height of the video frame
+        """
+        self.tracking_target = (target_x, target_y)
+
+        center_x = frame_width // 2
+        center_y = frame_height // 2
+
+        dx = target_x - center_x
+        dy = target_y - center_y
+
+        # Dead zone - don't move if target is close enough to center
+        if abs(dx) < PTZ_DEAD_ZONE and abs(dy) < PTZ_DEAD_ZONE:
+            self.stop_camera()
+            return
+
+        # Scale speed based on how far off-center
+        max_offset = max(abs(dx), abs(dy))
+        pan_speed = min(PTZ_MAX_SPEED, max(1, int(max_offset / PTZ_SPEED_DIVISOR)))
+        tilt_speed = min(PTZ_TILT_MAX_SPEED, max(1, int(max_offset / PTZ_SPEED_DIVISOR)))
+
+        # Determine combined direction for diagonal movement
+        h_dir = ""
+        v_dir = ""
+        if abs(dx) >= PTZ_DEAD_ZONE:
+            h_dir = "right" if dx > 0 else "left"
+        if abs(dy) >= PTZ_DEAD_ZONE:
+            v_dir = "down" if dy > 0 else "up"
+
+        if h_dir and v_dir:
+            # Diagonal: PTZOptics uses leftup, rightup, leftdown, rightdown
+            self.move_camera(h_dir + v_dir, pan_speed, tilt_speed)
+        elif h_dir:
+            self.move_camera(h_dir, pan_speed, tilt_speed)
+        elif v_dir:
+            self.move_camera(v_dir, pan_speed, tilt_speed)
+
     def get_camera_frame(self):
         """
         Retrieve a single frame from the PTZOptics camera via RTSP.
@@ -249,10 +448,12 @@ class PTZMotionDetector:
     def cleanup(self):
         """
         Clean up camera resources.
-        
-        Releases the RTSP video capture object to free system resources.
+
+        Releases the RTSP video capture object and stops PTZ movement.
         Should be called when detection is finished.
         """
+        if self.tracking_enabled:
+            self.stop_camera()
         if self.cap is not None:
             self.cap.release()
     
@@ -271,8 +472,15 @@ class PTZMotionDetector:
             Press 'q' to quit when display is enabled, or use Ctrl+C to interrupt.
         """
         print(f"Starting PTZOptics motion detection for camera at {self.camera_ip}")
+        if self.tracking_enabled:
+            print("PTZ tracking enabled - camera will follow detected targets")
+            print("Left-click a detected target to lock onto it, right-click to clear selection")
         print("Press 'q' to quit the display window")
-        
+
+        if display and self.tracking_enabled:
+            cv2.namedWindow("PTZOptics Motion Detection")
+            cv2.setMouseCallback("PTZOptics Motion Detection", self.on_mouse_click)
+
         frame_count = 0
         
         while True:
@@ -292,8 +500,36 @@ class PTZMotionDetector:
             
             # Check for faces with frame skipping and persistence (runs independently of motion)
             person_detected, people = self.detect_person_with_persistence(frame)
-            
-            
+
+            # PTZ tracking: click-to-select overrides automatic, then faces, then motion
+            if self.tracking_enabled:
+                # Check for new click selection
+                self.select_target_from_click(people, motion_areas)
+
+                if self.selected_target is not None:
+                    # User has selected a specific target - track it
+                    target_pos = self.update_selected_target(people, motion_areas)
+                    if target_pos:
+                        self.track_target(target_pos[0], target_pos[1],
+                                          frame.shape[1], frame.shape[0])
+                    else:
+                        # Selected target was lost, stop camera
+                        self.tracking_target = None
+                        self.stop_camera()
+                elif person_detected and len(people) > 0:
+                    # Auto-track the largest face
+                    largest = max(people, key=lambda r: r[2] * r[3])
+                    x, y, w, h = largest
+                    self.track_target(x + w // 2, y + h // 2, frame.shape[1], frame.shape[0])
+                elif motion_detected and len(motion_areas) > 0:
+                    # Fall back to tracking largest motion area
+                    largest = max(motion_areas, key=lambda r: r[2] * r[3])
+                    x, y, w, h = largest
+                    self.track_target(x + w // 2, y + h // 2, frame.shape[1], frame.shape[0])
+                else:
+                    self.tracking_target = None
+                    self.stop_camera()
+
             # Display if requested
             if display:
                 display_frame = frame.copy()
@@ -305,8 +541,23 @@ class PTZMotionDetector:
                 # Draw face detections in red
                 for (x, y, w, h) in people:
                     cv2.rectangle(display_frame, (x, y), (x + w, y + h), PERSON_COLOR, 2)
-                    cv2.putText(display_frame, "Face", (x, y - 10), 
+                    cv2.putText(display_frame, "Face", (x, y - 10),
                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, PERSON_COLOR, 2)
+
+                # Draw tracking visuals
+                if self.tracking_enabled and self.tracking_target:
+                    tx, ty = self.tracking_target
+                    cv2.drawMarker(display_frame, (tx, ty), TRACKING_COLOR,
+                                   cv2.MARKER_CROSS, 30, 2)
+                    label = "LOCKED" if self.selected_target else "TRACKING"
+                    cv2.putText(display_frame, label, (tx + 15, ty - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, TRACKING_COLOR, 2)
+
+                # Highlight the user-selected target with a thicker box
+                if self.tracking_enabled and self.selected_target:
+                    sx, sy, sw, sh = self.selected_target
+                    cv2.rectangle(display_frame, (sx, sy), (sx + sw, sy + sh),
+                                  TRACKING_COLOR, 3)
                 
                 # Draw status indicator circle (red/green light)
                 indicator_color = GREEN_LIGHT if motion_detected else RED_LIGHT
@@ -318,8 +569,16 @@ class PTZMotionDetector:
                           STATUS_INDICATOR_SIZE//2, (255, 255, 255), 2)
                 
                 # Display detection status text
-                status = "MOTION + FACE" if (motion_detected and person_detected) else \
-                        "MOTION DETECTED" if motion_detected else "NO MOTION"
+                if self.tracking_enabled and self.selected_target:
+                    status = "LOCKED ON TARGET"
+                elif self.tracking_enabled and self.tracking_target:
+                    status = "TRACKING FACE" if person_detected else "TRACKING MOTION"
+                elif motion_detected and person_detected:
+                    status = "MOTION + FACE"
+                elif motion_detected:
+                    status = "MOTION DETECTED"
+                else:
+                    status = "NO MOTION"
                 cv2.putText(display_frame, status, (STATUS_INDICATOR_POSITION[0] + 40, STATUS_INDICATOR_POSITION[1] + 5), 
                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, STATUS_COLOR, 2)
                 
@@ -358,14 +617,23 @@ def main():
                        help=f'Minimum motion area in pixels (default: {DEFAULT_MIN_AREA})')
     parser.add_argument('--stream', type=int, default=2, choices=[1, 2],
                        help='Camera stream to use: 1 for higher quality, 2 for lower latency (default: 2)')
-    
+    parser.add_argument('--track', action='store_true',
+                       help='Enable PTZ tracking to follow detected faces/motion')
+    parser.add_argument('--username', default='admin',
+                       help='Camera username for HTTP-CGI authentication (default: admin)')
+    parser.add_argument('--password', default='admin',
+                       help='Camera password for HTTP-CGI authentication (default: admin)')
+
     args = parser.parse_args()
-    
+
     detector = PTZMotionDetector(
         camera_ip=args.camera_ip,
         sensitivity=args.sensitivity,
         min_area=args.min_area,
-        stream=f"stream{args.stream}"
+        stream=f"stream{args.stream}",
+        enable_tracking=args.track,
+        username=args.username,
+        password=args.password
     )
     
     try:
