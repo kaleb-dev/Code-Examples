@@ -53,15 +53,21 @@ DETECTION_FRAME_WIDTH = 640      # Downscale frames to this width for detection 
 BACKGROUND_DETECT_SHADOWS = True # Enable shadow detection in background subtraction
 MORPH_KERNEL_SIZE = (3, 3)       # Kernel size for morphological operations
 
-# Person detection settings
-PERSON_SCALE_FACTOR = 1.1        # Scale factor for person detection
-PERSON_MIN_NEIGHBORS = 3         # Minimum neighbors for person detection
-PERSON_MIN_SIZE = (30, 30)       # Minimum size for person detection
+# Face detection settings (Haar cascade)
+FACE_SCALE_FACTOR = 1.1          # Scale factor for face detection cascade
+FACE_MIN_NEIGHBORS = 4           # Minimum neighbors for face detection (higher = fewer false positives)
+FACE_MIN_SIZE = (30, 30)         # Minimum face size in pixels
 
-# Full body detection settings
-BODY_SCALE_FACTOR = 1.05         # Scale factor for full body detection
-BODY_MIN_NEIGHBORS = 3           # Minimum neighbors for full body detection
-BODY_MIN_SIZE = (60, 120)        # Minimum size for full body detection
+# HOG body detection settings (cv2.HOGDescriptor - trained on human pedestrians only)
+HOG_WIN_STRIDE = (8, 8)          # Sliding window stride (smaller = more thorough, slower)
+HOG_PADDING = (8, 8)             # Padding around detection window
+HOG_SCALE = 1.05                 # Image pyramid scale factor
+HOG_HIT_THRESHOLD = 0.3          # SVM confidence threshold (higher = fewer false positives)
+
+# Upper body detection settings (Haar cascade - catches seated/partial people)
+UPPERBODY_SCALE_FACTOR = 1.1     # Scale factor for upper body detection
+UPPERBODY_MIN_NEIGHBORS = 4      # Minimum neighbors (higher = fewer false positives)
+UPPERBODY_MIN_SIZE = (40, 40)    # Minimum upper body size
 
 # PTZ tracking settings
 PTZ_DEAD_ZONE = 80               # Pixels from center before camera moves (wider = smoother)
@@ -125,13 +131,21 @@ class PTZMotionDetector:
             detectShadows=BACKGROUND_DETECT_SHADOWS
         )
 
-        # Load Haar cascade classifiers for face and full body detection
-        self.person_cascade = cv2.CascadeClassifier(
+        # Face detection: Haar cascade for frontal faces
+        self.face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
         )
-        self.body_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_fullbody.xml'
+
+        # Upper body detection: Haar cascade for seated/partial people
+        self.upperbody_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_upperbody.xml'
         )
+
+        # Full body detection: HOG descriptor with pre-trained people detector
+        # This is OpenCV's most reliable human detector - trained specifically
+        # on upright human bodies, won't false-detect on curtains/equipment/props
+        self.hog = cv2.HOGDescriptor()
+        self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
 
         # Motion smoothing
         self.motion_frames_count = 0
@@ -190,61 +204,51 @@ class PTZMotionDetector:
 
     def update_selected_target(self, person_detections):
         """
-        Update the locked target using IoU + proximity scoring.
+        Update the locked target strictly using IoU overlap.
 
-        Sticks to the same person by heavily weighting overlap and penalizing
-        distance. Won't jump to a different person across the frame.
+        Only matches detections that actually overlap with the current target
+        bounding box. Will NOT jump to a person in a different part of the frame.
+        If the person moves, the camera follows via PTZ commands which shifts
+        the detection box naturally — IoU stays high for the same person.
         """
         if self.selected_target is None:
             return None
 
         sx, sy, sw, sh = self.selected_target
-        s_cx = sx + sw // 2
-        s_cy = sy + sh // 2
         best_match = None
-        best_score = -1
+        best_iou = 0
 
         for (x, y, w, h) in person_detections:
-            # Calculate IoU overlap
+            # Calculate IoU overlap — the ONLY matching criterion
             ix1 = max(sx, x)
             iy1 = max(sy, y)
             ix2 = min(sx + sw, x + w)
             iy2 = min(sy + sh, y + h)
 
-            iou = 0
             if ix2 > ix1 and iy2 > iy1:
                 intersection = (ix2 - ix1) * (iy2 - iy1)
                 union = sw * sh + w * h - intersection
                 iou = intersection / union if union > 0 else 0
 
-            # Calculate center distance
-            d_cx = x + w // 2
-            d_cy = y + h // 2
-            dist = ((s_cx - d_cx) ** 2 + (s_cy - d_cy) ** 2) ** 0.5
+                if iou > best_iou:
+                    best_iou = iou
+                    best_match = (x, y, w, h)
 
-            # Score: heavily weight IoU, penalize distance
-            dist_penalty = min(dist / 500.0, 1.0)
-            score = iou * 2.0 + (1.0 - dist_penalty)
-
-            if score > best_score:
-                best_score = score
-                best_match = (x, y, w, h)
-
-        # Require minimum score to prevent jumping to a distant person
-        if best_match and best_score > 0.5:
+        # Require real overlap — no distance-only matches
+        if best_match and best_iou > 0.15:
             x, y, w, h = best_match
             self.selected_target = best_match
             self.selected_target_center = (x + w // 2, y + h // 2)
             self.target_lost_frames = 0
             return self.selected_target_center
         else:
-            # Target not matched this frame - hold position briefly
+            # No overlapping detection found
             self.target_lost_frames += 1
             if self.target_lost_frames < self.TARGET_LOST_THRESHOLD:
-                # Keep tracking last known position
+                # Hold last known position briefly (person may be between detection frames)
                 return self.selected_target_center
             else:
-                print("Target lost")
+                print("Target lost - no matching person detection")
                 self.selected_target = None
                 self.selected_target_center = None
                 self.target_lost_frames = 0
@@ -402,17 +406,17 @@ class PTZMotionDetector:
         s = 1.0 / self.detection_scale
         return [(int(x * s), int(y * s), int(w * s), int(h * s)) for (x, y, w, h) in detections]
 
-    def detect_person_with_persistence(self, gray):
+    def detect_faces_with_persistence(self, gray):
         """Detect faces with frame skipping and result persistence."""
         self.face_detection_counter += 1
 
         if self.face_detection_counter >= FACE_DETECTION_INTERVAL:
             self.face_detection_counter = 0
-            people = self.person_cascade.detectMultiScale(
-                gray, scaleFactor=PERSON_SCALE_FACTOR,
-                minNeighbors=PERSON_MIN_NEIGHBORS, minSize=PERSON_MIN_SIZE
+            raw_faces = self.face_cascade.detectMultiScale(
+                gray, scaleFactor=FACE_SCALE_FACTOR,
+                minNeighbors=FACE_MIN_NEIGHBORS, minSize=FACE_MIN_SIZE
             )
-            faces = self.scale_detections(people)
+            faces = self.scale_detections(raw_faces)
             face_detected = len(faces) > 0
 
             if face_detected:
@@ -428,17 +432,71 @@ class PTZMotionDetector:
             return self.last_face_result
         return False, []
 
-    def detect_bodies_with_persistence(self, gray):
-        """Detect full bodies with frame skipping and result persistence."""
+    def detect_bodies_with_persistence(self, frame, gray):
+        """
+        Detect human bodies using HOG people detector + upper body cascade.
+
+        HOG (Histogram of Oriented Gradients) with the default people detector
+        is OpenCV's most reliable human detector. It's trained specifically on
+        upright human pedestrians and will NOT false-detect on curtains, stage
+        equipment, or other non-human objects.
+
+        Upper body cascade catches seated or partially visible people that
+        HOG might miss.
+        """
         self.body_detection_counter += 1
 
         if self.body_detection_counter >= BODY_DETECTION_INTERVAL:
             self.body_detection_counter = 0
-            raw_bodies = self.body_cascade.detectMultiScale(
-                gray, scaleFactor=BODY_SCALE_FACTOR,
-                minNeighbors=BODY_MIN_NEIGHBORS, minSize=BODY_MIN_SIZE
+
+            # Downscale frame for HOG detection (needs color or gray, works on both)
+            if DETECTION_FRAME_WIDTH > 0 and frame.shape[1] > DETECTION_FRAME_WIDTH:
+                scale = DETECTION_FRAME_WIDTH / frame.shape[1]
+                small_frame = cv2.resize(frame, None, fx=scale, fy=scale)
+            else:
+                scale = 1.0
+                small_frame = frame
+
+            # HOG people detector — the gold standard for human body detection
+            hog_rects, weights = self.hog.detectMultiScale(
+                small_frame,
+                winStride=HOG_WIN_STRIDE,
+                padding=HOG_PADDING,
+                scale=HOG_SCALE,
+                hitThreshold=HOG_HIT_THRESHOLD
             )
-            bodies = self.scale_detections(raw_bodies)
+
+            # Upper body cascade for seated/partial people
+            upperbody_rects = self.upperbody_cascade.detectMultiScale(
+                gray, scaleFactor=UPPERBODY_SCALE_FACTOR,
+                minNeighbors=UPPERBODY_MIN_NEIGHBORS,
+                minSize=UPPERBODY_MIN_SIZE
+            )
+
+            # Scale HOG detections back to full resolution
+            bodies = []
+            if len(hog_rects) > 0:
+                for (x, y, w, h) in hog_rects:
+                    bodies.append((int(x / scale), int(y / scale),
+                                   int(w / scale), int(h / scale)))
+
+            # Scale upper body detections back to full resolution
+            upper_bodies = self.scale_detections(upperbody_rects)
+
+            # Merge: add upper bodies that don't overlap with HOG detections
+            for ub in upper_bodies:
+                overlaps = False
+                for b in bodies:
+                    ix1 = max(ub[0], b[0])
+                    iy1 = max(ub[1], b[1])
+                    ix2 = min(ub[0] + ub[2], b[0] + b[2])
+                    iy2 = min(ub[1] + ub[3], b[1] + b[3])
+                    if ix2 > ix1 and iy2 > iy1:
+                        overlaps = True
+                        break
+                if not overlaps:
+                    bodies.append(ub)
+
             body_detected = len(bodies) > 0
 
             if body_detected:
@@ -516,22 +574,28 @@ class PTZMotionDetector:
             # Prepare downscaled grayscale once, shared by face and body detection
             gray = self.get_detection_frame(frame)
 
-            # Detect faces and bodies with frame skipping
-            person_detected, people = self.detect_person_with_persistence(gray)
-            bodies_detected, bodies = self.detect_bodies_with_persistence(gray)
+            # Detect human faces and bodies only (no generic motion tracking)
+            person_detected, people = self.detect_faces_with_persistence(gray)
+            bodies_detected, bodies = self.detect_bodies_with_persistence(frame, gray)
 
-            # PTZ tracking: only tracks people, only when user clicks to select
+            # PTZ tracking: only tracks human detections, only when user clicks
             if self.tracking_enabled:
+                # Only human detections — bodies first (larger/more stable), then faces
                 person_detections = list(bodies) + list(people)
                 self.select_target_from_click(person_detections)
 
                 if self.selected_target is not None:
                     target_pos = self.update_selected_target(person_detections)
-                    if target_pos:
+                    if target_pos and self.target_lost_frames == 0:
+                        # Only send PTZ commands when we have a fresh match
                         self.track_target(target_pos[0], target_pos[1],
                                           frame.shape[1], frame.shape[0])
-                    else:
+                    elif target_pos is None:
+                        # Target truly lost — stop immediately
                         self.tracking_target = None
+                        self.stop_camera()
+                    else:
+                        # Target temporarily lost — stop camera, don't pan randomly
                         self.stop_camera()
                 else:
                     self.tracking_target = None
@@ -550,10 +614,10 @@ class PTZMotionDetector:
                     cv2.putText(display_frame, "Face", (x, y - 10),
                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, PERSON_COLOR, 2)
 
-                # Draw full body detections in magenta
+                # Draw human body detections in magenta (HOG + upper body)
                 for (x, y, w, h) in bodies:
                     cv2.rectangle(display_frame, (x, y), (x + w, y + h), BODY_COLOR, 2)
-                    cv2.putText(display_frame, "Body", (x, y - 10),
+                    cv2.putText(display_frame, "Person", (x, y - 10),
                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, BODY_COLOR, 2)
 
                 # Draw tracking crosshair and selected target highlight
