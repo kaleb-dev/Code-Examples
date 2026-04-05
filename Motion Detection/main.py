@@ -22,6 +22,7 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 import cv2
 import numpy as np
 import time
+import threading
 from datetime import datetime
 import argparse
 import requests
@@ -32,7 +33,8 @@ from requests.auth import HTTPDigestAuth
 # =============================================================================
 
 # Camera connection settings
-DEFAULT_RTSP_STREAM = "stream2"  # Use stream2 for lower latency, stream1 for higher quality
+DEFAULT_RTSP_STREAM = "stream1"  # Use stream1 for native resolution, stream2 for lower latency
+TARGET_FPS = 30                  # Target display frame rate
 
 # Motion detection parameters
 DEFAULT_SENSITIVITY = 50         # Motion sensitivity (lower = more sensitive)
@@ -67,9 +69,9 @@ PTZ_SPEED_DIVISOR = 50           # Higher = slower speed scaling for smoother mo
 PTZ_MAX_SPEED = 12               # Maximum pan speed (PTZOptics range: 1-24, capped low for smoothness)
 PTZ_TILT_MAX_SPEED = 10          # Maximum tilt speed (PTZOptics range: 1-20, capped low for smoothness)
 
-# Display settings
-DISPLAY_WIDTH = 1280             # Window display width (0 = native frame size)
-DISPLAY_HEIGHT = 720             # Window display height (0 = native frame size)
+# Display settings (0 = use native stream resolution)
+DISPLAY_WIDTH = 0                # Window display width (0 = native frame size)
+DISPLAY_HEIGHT = 0               # Window display height (0 = native frame size)
 MOTION_COLOR = (0, 255, 0)       # Green color for motion bounding boxes (BGR)
 PERSON_COLOR = (0, 0, 255)       # Red color for face bounding boxes (BGR)
 BODY_COLOR = (255, 0, 255)       # Magenta color for body bounding boxes (BGR)
@@ -103,6 +105,9 @@ class PTZMotionDetector:
         self.camera_ip = camera_ip
         self.rtsp_url = f"rtsp://{camera_ip}/{stream}"
         self.cap = None
+        self._latest_frame = None
+        self._frame_lock = threading.Lock()
+        self._grabber_running = False
 
         self.sensitivity = sensitivity
         self.min_area = min_area
@@ -293,47 +298,60 @@ class PTZMotionDetector:
         elif v_dir:
             self.move_camera(v_dir, pan_speed, tilt_speed)
 
-    def get_camera_frame(self):
+    def start_frame_grabber(self):
         """
-        Retrieve the most recent frame from the PTZOptics camera via RTSP.
+        Start a background thread that continuously grabs frames from RTSP.
 
-        Uses TCP transport to eliminate h264 decode errors from UDP packet loss.
-        Drains the buffer to always process the latest frame.
+        This decouples frame capture from processing so the display stays smooth
+        at 30fps even when detection takes longer. The thread always holds the
+        latest frame, discarding older ones automatically.
         """
-        if self.cap is None:
-            print(f"Connecting to RTSP stream: {self.rtsp_url}")
-            self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
-            self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
-            self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
-            if not self.cap.isOpened():
-                tcp_url = f"{self.rtsp_url}?tcp"
-                print(f"Retrying with TCP: {tcp_url}")
-                self.cap = cv2.VideoCapture(tcp_url, cv2.CAP_FFMPEG)
-            if not self.cap.isOpened():
-                print("Failed to open RTSP stream")
-                self.cap = None
-                return None
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            print("RTSP stream connected")
+        print(f"Connecting to RTSP stream: {self.rtsp_url}")
+        self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+        self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+        self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+        if not self.cap.isOpened():
+            tcp_url = f"{self.rtsp_url}?tcp"
+            print(f"Retrying with TCP: {tcp_url}")
+            self.cap = cv2.VideoCapture(tcp_url, cv2.CAP_FFMPEG)
+        if not self.cap.isOpened():
+            print("Failed to open RTSP stream")
+            self.cap = None
+            return False
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-        # Drain buffer to get the latest frame (prevents falling behind real-time)
-        for _ in range(5):
-            grabbed = self.cap.grab()
-            if not grabbed:
+        # Read stream properties
+        w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        print(f"RTSP stream connected: {w}x{h} @ {fps:.1f}fps")
+
+        self._latest_frame = None
+        self._frame_lock = threading.Lock()
+        self._grabber_running = True
+        self._grab_thread = threading.Thread(target=self._frame_grab_loop, daemon=True)
+        self._grab_thread.start()
+        return True
+
+    def _frame_grab_loop(self):
+        """Background thread that continuously reads the latest frame."""
+        while self._grabber_running:
+            if self.cap is None:
                 break
+            ret, frame = self.cap.read()
+            if ret:
+                with self._frame_lock:
+                    self._latest_frame = frame
+            else:
+                # Brief pause on read failure before retry
+                time.sleep(0.01)
 
-        ret, frame = self.cap.retrieve()
-        if ret:
-            return frame
-
-        ret, frame = self.cap.read()
-        if ret:
-            return frame
-
-        print("Failed to read frame, attempting reconnection...")
-        self.cap.release()
-        self.cap = None
-        return None
+    def get_camera_frame(self):
+        """Get the most recent frame from the background grabber thread."""
+        if self._latest_frame is None:
+            return None
+        with self._frame_lock:
+            return self._latest_frame.copy()
 
     def detect_motion(self, frame):
         """Detect motion using background subtraction."""
@@ -437,35 +455,56 @@ class PTZMotionDetector:
         return False, []
 
     def cleanup(self):
-        """Clean up camera resources and stop PTZ movement."""
+        """Clean up camera resources, stop grabber thread, and stop PTZ movement."""
+        self._grabber_running = False
+        if hasattr(self, '_grab_thread') and self._grab_thread.is_alive():
+            self._grab_thread.join(timeout=2)
         if self.tracking_enabled:
             self.stop_camera()
         if self.cap is not None:
             self.cap.release()
 
     def run_detection(self, display=False, save_detections=False):
-        """Run the main motion detection and tracking loop."""
+        """Run the main motion detection and tracking loop at target FPS."""
         print(f"Starting PTZOptics motion detection for camera at {self.camera_ip}")
         if self.tracking_enabled:
             print("PTZ tracking enabled - click on a person (body/face) to lock and track them")
             print("Left-click to select, right-click to stop tracking")
         print("Press 'q' to quit the display window")
 
+        # Start background frame grabber
+        if not self.start_frame_grabber():
+            print("Could not connect to camera. Exiting.")
+            return
+
+        # Wait for first frame
+        for _ in range(50):
+            if self.get_camera_frame() is not None:
+                break
+            time.sleep(0.1)
+
         window_name = "PTZOptics Motion Detection"
         if display:
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-            if DISPLAY_WIDTH > 0 and DISPLAY_HEIGHT > 0:
-                cv2.resizeWindow(window_name, DISPLAY_WIDTH, DISPLAY_HEIGHT)
+            # Use native resolution or configured display size
+            first_frame = self.get_camera_frame()
+            if first_frame is not None:
+                if DISPLAY_WIDTH > 0 and DISPLAY_HEIGHT > 0:
+                    cv2.resizeWindow(window_name, DISPLAY_WIDTH, DISPLAY_HEIGHT)
+                else:
+                    cv2.resizeWindow(window_name, first_frame.shape[1], first_frame.shape[0])
             if self.tracking_enabled:
                 cv2.setMouseCallback(window_name, self.on_mouse_click)
 
         frame_count = 0
+        frame_interval = 1.0 / TARGET_FPS
 
         while True:
+            loop_start = time.perf_counter()
+
             frame = self.get_camera_frame()
             if frame is None:
-                print("Failed to get frame, retrying in 2 seconds...")
-                time.sleep(2)
+                time.sleep(0.03)
                 continue
 
             frame_count += 1
@@ -562,6 +601,12 @@ class PTZMotionDetector:
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
+            # Pace to target FPS
+            elapsed = time.perf_counter() - loop_start
+            wait_time = frame_interval - elapsed
+            if wait_time > 0:
+                time.sleep(wait_time)
+
         self.cleanup()
         if display:
             cv2.destroyAllWindows()
@@ -576,8 +621,8 @@ def main():
                        help=f'Motion sensitivity (lower = more sensitive, default: {DEFAULT_SENSITIVITY})')
     parser.add_argument('--min-area', type=int, default=DEFAULT_MIN_AREA,
                        help=f'Minimum motion area in pixels (default: {DEFAULT_MIN_AREA})')
-    parser.add_argument('--stream', type=int, default=2, choices=[1, 2],
-                       help='Camera stream: 1 for higher quality, 2 for lower latency (default: 2)')
+    parser.add_argument('--stream', type=int, default=1, choices=[1, 2],
+                       help='Camera stream: 1 for native resolution, 2 for lower latency (default: 1)')
     parser.add_argument('--track', action='store_true',
                        help='Enable PTZ tracking - click a person to follow them')
     parser.add_argument('--username', default='admin',
